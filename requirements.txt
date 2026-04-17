@@ -1,0 +1,9 @@
+python-telegram-bot[job-queue]==21.4
+pandas==2.2.2
+numpy==2.0.1
+matplotlib==3.9.1
+mplfinance==0.12.10b0
+requests==2.32.3
+python-dotenv==1.0.1
+Pillow==10.4.0
+tzdata>=2024.1

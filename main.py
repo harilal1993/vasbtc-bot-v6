@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import threading
@@ -13,7 +12,13 @@ from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-from chat_assistant import answer_free_text, daily_summary_text, format_mtf, half_hour_prediction_text, screenshot_reply
+from chat_assistant import (
+    answer_free_text,
+    daily_summary_text,
+    format_mtf,
+    half_hour_prediction_text,
+    screenshot_reply,
+)
 from chart_generator import render_signal_chart
 from security import SimpleSecurity
 from signal_engine import generate_signal, multi_timeframe_summary
@@ -24,29 +29,40 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-ALERT_INTERVAL_SECONDS = int(os.getenv("ALERT_INTERVAL_SECONDS", "1800"))
+ALERT_INTERVAL_SECONDS = int(os.getenv("ALERT_INTERVAL_SECONDS", "900"))
 DAILY_SUMMARY_HOUR_UTC = int(os.getenv("DAILY_SUMMARY_HOUR_UTC", "18"))
-HALF_HOUR_PREDICTION_SECONDS = int(os.getenv("HALF_HOUR_PREDICTION_SECONDS", "1800"))
-SEND_ALERT_CHARTS = os.getenv("SEND_ALERT_CHARTS", "false").strip().lower() == "true"
-
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
-VALID_TF = {"1m", "5m", "15m", "30m", "1h", "4h"}
+PORT = int(os.getenv("PORT", "10000"))
 
 storage = JsonStorage()
 security = SimpleSecurity()
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/healthz"):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"ok")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+
+def run_health_server():
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+        logger.info("Health server listening on port %s", PORT)
+        server.serve_forever()
+    except Exception:
+        logger.exception("Health server failed")
+
+
 def state():
     return storage.load()
-
-
-def summary_hash(summary) -> str:
-    s = summary.signal
-    raw = (
-        f"{summary.preferred_timeframe}|{summary.alignment_bias}|{summary.alignment_score}|"
-        f"{s.bias}|{s.entry}|{s.stop_loss}|{s.tp1}|{s.tp2}|{s.tp3}|{s.projected_30m_target}"
-    )
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
 
 
 def allowed(update: Update) -> bool:
@@ -68,8 +84,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "BTC V6 bot is running.\n"
         "Commands:\n"
-        "/start\n/status\n/now\n/prediction\n/chart 30m\n/summary\n"
-        "/balance 50\n/risk 1\n/timeframe 15m\n/pause\n/resume"
+        "/now\n"
+        "/prediction\n"
+        "/chart 30m\n"
+        "/balance 50\n"
+        "/risk 1\n"
+        "/timeframe 15m\n"
+        "/status\n"
+        "/summary\n"
+        "/pause\n"
+        "/resume"
     )
 
 
@@ -83,8 +107,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Balance: ${s.get('balance', 50):.2f}\n"
         f"Risk: {s.get('risk_percent', 1):.2f}%\n"
         f"Preferred timeframe: {s.get('preferred_timeframe', '15m')}\n"
-        f"Alert interval: {ALERT_INTERVAL_SECONDS}s\n"
-        f"Prediction interval: {HALF_HOUR_PREDICTION_SECONDS}s"
+        f"Alert interval: {ALERT_INTERVAL_SECONDS} sec"
     )
 
 
@@ -126,7 +149,7 @@ async def timeframe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not allowed(update):
         await reject(update)
         return
-    if not context.args or context.args[0] not in VALID_TF:
+    if not context.args or context.args[0] not in {"1m", "5m", "15m", "30m", "1h", "4h"}:
         await update.message.reply_text("Use like: /timeframe 15m")
         return
     s = state()
@@ -215,7 +238,7 @@ async def chart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tf = "30m"
     if context.args:
         tf = context.args[0].strip().lower()
-    if tf not in VALID_TF:
+    if tf not in {"1m", "5m", "15m", "30m", "1h", "4h"}:
         await update.message.reply_text("Supported: 1m, 5m, 15m, 30m, 1h, 4h")
         return
     st = state()
@@ -226,64 +249,52 @@ async def chart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         with open(img, "rb") as f:
             await update.message.reply_photo(photo=f, caption=f"BTC {tf} chart ready.")
     except Exception as e:
-        logger.exception("Chart command failed")
+        logger.exception("Chart failed")
         await update.message.reply_text(f"Chart failed: {e}")
-
-
-async def _reply_to_screenshot(update: Update) -> None:
-    st = state()
-    caption = update.message.caption or ""
-    await update.message.reply_text(
-        screenshot_reply(
-            caption,
-            st.get("balance", 50.0),
-            st.get("risk_percent", 1.0),
-            st.get("preferred_timeframe", "15m"),
-        )
-    )
 
 
 async def screenshot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         await reject(update)
         return
+
+    st = state()
+    caption = update.message.caption or ""
+
     try:
-        photos = update.message.photo or []
-        if not photos:
+        if update.message.photo:
+            photos = update.message.photo
+            file = await photos[-1].get_file()
+            Path("data/screenshots").mkdir(parents=True, exist_ok=True)
+            local_path = f"data/screenshots/{file.file_unique_id}.jpg"
+            await file.download_to_drive(local_path)
+
+        elif update.message.document:
+            doc = update.message.document
+            name = (doc.file_name or "").lower()
+            if not (name.endswith(".jpg") or name.endswith(".jpeg") or name.endswith(".png") or (doc.mime_type or "").startswith("image/")):
+                await update.message.reply_text("Please upload an image file.")
+                return
+            file = await doc.get_file()
+            Path("data/screenshots").mkdir(parents=True, exist_ok=True)
+            suffix = ".png" if name.endswith(".png") else ".jpg"
+            local_path = f"data/screenshots/{file.file_unique_id}{suffix}"
+            await file.download_to_drive(local_path)
+        else:
             await update.message.reply_text("No screenshot received.")
             return
-        file = await photos[-1].get_file()
-        Path("data/screenshots").mkdir(parents=True, exist_ok=True)
-        local_path = f"data/screenshots/{file.file_unique_id}.jpg"
-        await file.download_to_drive(local_path)
-        await _reply_to_screenshot(update)
+
+        await update.message.reply_text(
+            screenshot_reply(
+                caption,
+                st.get("balance", 50.0),
+                st.get("risk_percent", 1.0),
+                st.get("preferred_timeframe", "15m"),
+            )
+        )
     except Exception as e:
-        logger.exception("Screenshot handling failed")
+        logger.exception("Screenshot analysis failed")
         await update.message.reply_text(f"Analysis failed: {e}")
-
-
-async def document_image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not allowed(update):
-        await reject(update)
-        return
-    try:
-        doc = update.message.document
-        if not doc:
-            return
-        file_name = (doc.file_name or "").lower()
-        mime = (doc.mime_type or "").lower()
-        if not any(file_name.endswith(ext) for ext in IMAGE_EXTENSIONS) and not mime.startswith("image/"):
-            await update.message.reply_text("Please upload chart as photo or PNG/JPG image file.")
-            return
-        file = await doc.get_file()
-        suffix = Path(file_name).suffix or ".jpg"
-        Path("data/screenshots").mkdir(parents=True, exist_ok=True)
-        local_path = f"data/screenshots/{file.file_unique_id}{suffix}"
-        await file.download_to_drive(local_path)
-        await _reply_to_screenshot(update)
-    except Exception as e:
-        logger.exception("Document image handling failed")
-        await update.message.reply_text(f"Image analysis failed: {e}")
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -319,7 +330,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if low.startswith("timeframe "):
         tf = low.split(" ", 1)[1].strip()
-        if tf not in VALID_TF:
+        if tf not in {"1m", "5m", "15m", "30m", "1h", "4h"}:
             await update.message.reply_text("Supported timeframes: 1m, 5m, 15m, 30m, 1h, 4h")
             return
         s = state()
@@ -338,7 +349,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         await update.message.reply_text(reply)
     except Exception as e:
-        logger.exception("Text request failed")
+        logger.exception("Request failed")
         await update.message.reply_text(f"Request failed: {e}")
 
 
@@ -346,38 +357,11 @@ async def periodic_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
     s = state()
     if s.get("paused", False):
         return
+
     admin_id = os.getenv("TELEGRAM_ADMIN_USER_ID")
     if not admin_id:
         return
-    preferred = s.get("preferred_timeframe", "15m")
-    try:
-        summary = multi_timeframe_summary(preferred, s.get("balance", 50.0), s.get("risk_percent", 1.0))
-        h = summary_hash(summary)
-        key = preferred
-        last_hash = s.get("last_signal_hash", {})
-        if last_hash.get(key) != h:
-            await context.bot.send_message(chat_id=int(admin_id), text="Fresh BTC signal\n" + format_mtf(summary))
-            if SEND_ALERT_CHARTS:
-                try:
-                    img = render_signal_chart(summary.signal)
-                    with open(img, "rb") as f:
-                        await context.bot.send_photo(chat_id=int(admin_id), photo=f)
-                except Exception:
-                    logger.exception("Alert chart send failed; continuing without chart")
-            last_hash[key] = h
-            s["last_signal_hash"] = last_hash
-            storage.save(s)
-    except Exception:
-        logger.exception("Alert loop failed")
 
-
-async def half_hour_prediction_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    s = state()
-    if s.get("paused", False):
-        return
-    admin_id = os.getenv("TELEGRAM_ADMIN_USER_ID")
-    if not admin_id:
-        return
     try:
         text = half_hour_prediction_text(
             s.get("balance", 50.0),
@@ -385,21 +369,25 @@ async def half_hour_prediction_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             s.get("preferred_timeframe", "15m"),
         )
         await context.bot.send_message(chat_id=int(admin_id), text=text)
+        logger.info("15-minute alert sent successfully")
     except Exception:
-        logger.exception("Prediction schedule failed")
+        logger.exception("15-minute alert failed")
 
 
 async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     admin_id = os.getenv("TELEGRAM_ADMIN_USER_ID")
     if not admin_id:
         return
+
     s = state()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if s.get("daily_summary_sent_date") == today:
         return
+
     now_hour = datetime.now(timezone.utc).hour
     if now_hour < DAILY_SUMMARY_HOUR_UTC:
         return
+
     try:
         text = daily_summary_text(
             s.get("balance", 50.0),
@@ -413,34 +401,12 @@ async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("Daily summary job failed")
 
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path in ("/", "/healthz"):
-            self.send_response(200)
-            self.send_header("Content-type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(b"ok")
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def log_message(self, format, *args):
-        return
-
-
-def start_health_server() -> None:
-    port = int(os.getenv("PORT", "10000"))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    logger.info("Health server started on port %s", port)
-
-
 def main() -> None:
     if not TOKEN:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
 
-    start_health_server()
+    threading.Thread(target=run_health_server, daemon=True).start()
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -456,15 +422,13 @@ def main() -> None:
     app.add_handler(CommandHandler("summary", summary_cmd))
     app.add_handler(CommandHandler("chart", chart_cmd))
     app.add_handler(MessageHandler(filters.PHOTO, screenshot_handler))
-    app.add_handler(MessageHandler(filters.Document.ALL, document_image_handler))
+    app.add_handler(MessageHandler(filters.Document.IMAGE, screenshot_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     if app.job_queue:
         app.job_queue.run_repeating(periodic_alerts, interval=ALERT_INTERVAL_SECONDS, first=60)
-        app.job_queue.run_repeating(half_hour_prediction_job, interval=HALF_HOUR_PREDICTION_SECONDS, first=180)
         app.job_queue.run_repeating(daily_summary_job, interval=3600, first=600)
 
-    logger.info("Starting Telegram polling")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
